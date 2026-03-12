@@ -61,15 +61,15 @@ token1 → token2 → token3 → ... → tokenL
 
 Autoregressive models follow the chain rule
 
-$$
-p(x) = \prod_{i=1}^{L} p(x_i \mid x_{<i})
-$$
+```math
+p(x) = \prod_{i=1}^{L} p(x_i \mid x_{1:i-1})
+```
 
 where
 
-$$
-x_{<i} = (x_1, x_2, ..., x_{i-1})
-$$
+```math
+x_{1:i-1} = (x_1, x_2, ..., x_{i-1})
+```
 
 ---
 
@@ -77,9 +77,9 @@ $$
 
 assume we're predicting x3 = sat, the model computes
 
-$$
+```math
 p(sat \mid the, cat)
-$$
+```
 
 so it only sees the **previous tokens**.
 
@@ -124,13 +124,9 @@ t = 1   → fully masked
 
 forward corruption process
 
-$$
-q(x_t^i \mid x_0^i)
-=
-(1-t)\mathbf{1}(x_t^i = x_0^i)
-+
-t\mathbf{1}(x_t^i = m)
-$$
+```math
+q(x_t^i \mid x_0^i) = (1-t)\,I[x_t^i = x_0^i] + t\,I[x_t^i = m]
+```
 
 where
 
@@ -162,14 +158,9 @@ model must predict masked tokens.
 
 Diffusion training objective
 
-$$
-L =
-\mathbb{E}_{t,x}
-\left[
-\sum_{i \in M_t}
--\log p_\theta(x_i \mid x_t)
-\right]
-$$
+```math
+L = E_{t,x}\Big[\sum_{i \in M_t} -\log p_{\theta}(x_i \mid x_t)\Big]
+```
 
 where
 
@@ -195,9 +186,9 @@ x2 = cat
 
 model computes
 
-$$
+```math
 p(cat \mid the, sat, the)
-$$
+```
 
 but in practice the model input still contains masks
 
@@ -207,9 +198,9 @@ the [MASK] sat [MASK] the [MASK]
 
 so mathematically the model learns
 
-$$
+```math
 p(x_i \mid x_{-i})
-$$
+```
 
 where
 
@@ -249,14 +240,14 @@ so it becomes x = [x¹, x²]
 
 BD3 factorization
 
-$$
-p(x) = \prod_{b=1}^{B} p(x^{b} \mid x_{<b})
-$$
+```math
+p(x) = \prod_{b=1}^{B} p(x^{b} \mid x_{1:b-1})
+```
 
 where
 
 ```
-x<b = previous blocks
+x_{1:b-1} = previous blocks
 ```
 
 ---
@@ -342,21 +333,21 @@ block2 attends to cached states from block1.
 
 AR model learns
 
-$$
-p(x_i \mid x_{<i})
-$$
+```math
+p(x_i \mid x_{1:i-1})
+```
 
 MDLM learns
 
-$$
+```math
 p(x_i \mid x_{-i})
-$$
+```
 
 BD3LM learns
 
-$$
-p(x^b \mid x_{<b})
-$$
+```math
+p(x^b \mid x_{1:b-1})
+```
 
 where each block internally uses diffusion.
 
