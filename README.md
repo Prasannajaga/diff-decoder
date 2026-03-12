@@ -20,7 +20,7 @@ x = [the, cat, sat, on, the, table]
 
 ---
 
-# AR - Autorgressive Language model
+# AR - Autoregressive Language model
 
 The AR model uses **transformer causal attention**  
 which predicts the **next token based on previous tokens**.
@@ -47,7 +47,7 @@ Token 5 (the) → sees the cat sat on
 Token 6 (table) → sees the cat sat on the
 ```
 
-so the tokens only has the acess to the **previous tokens**.
+so the tokens only have access to the **previous tokens**.
 
 generation happens **sequentially**
 
@@ -221,7 +221,7 @@ so the model can see **both past and future tokens**.
 
 ---
 
-# Block Discrete Denoise Diffusion Language Model (BD3LM)
+# Block Discrete Denoising Diffusion Language Model (BD3LM)
 
 BD3LM combines **autoregressive ordering + diffusion inside blocks**.
 
@@ -302,7 +302,7 @@ so previous blocks become clean fixed context.
 
 Diffusion repeatedly updates tokens
 
-```
+```text
 step1 → the [MASK] sat [MASK] table
 step2 → the cat sat on table
 step3 → the cat sat on the table
