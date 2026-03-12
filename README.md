@@ -1,6 +1,6 @@
 # AR, MDLM & BD3LM Language Models
 
-what is AR, MD & BD3 language model?
+What are AR, MDLM, and BD3LM language models?
 
 AR - autoregressive language model  
 MDLM - Masked diffusion language model  
@@ -20,7 +20,7 @@ x = [the, cat, sat, on, the, table]
 
 ---
 
-# AR - Autoregressive Language model
+# AR - Autoregressive Language Model
 
 The AR model uses **transformer causal attention**  
 which predicts the **next token based on previous tokens**.
@@ -39,15 +39,15 @@ attention mask looks like
 Token visibility:
 
 ```
-Token 1 (the) → sees nothing
-Token 2 (cat) → sees the
-Token 3 (sat) → sees the cat
-Token 4 (on)  → sees the cat sat
-Token 5 (the) → sees the cat sat on
-Token 6 (table) → sees the cat sat on the
+Token 1 (the) → sees the
+Token 2 (cat) → sees the cat
+Token 3 (sat) → sees the cat sat
+Token 4 (on)  → sees the cat sat on
+Token 5 (the) → sees the cat sat on the
+Token 6 (table) → sees the cat sat on the table
 ```
 
-so the tokens only have access to the **previous tokens**.
+so the tokens only have access to the **current and previous tokens**.
 
 generation happens **sequentially**
 
@@ -57,7 +57,7 @@ token1 → token2 → token3 → ... → tokenL
 
 ---
 
-### probability factorization
+### Probability Factorization
 
 Autoregressive models follow the chain rule
 
@@ -73,7 +73,7 @@ $$
 
 ---
 
-### example
+### Example
 
 assume we're predicting x3 = sat, the model computes
 
@@ -140,7 +140,7 @@ m = MASK token
 
 ---
 
-### example
+### Example
 
 input sentence
 
@@ -158,7 +158,7 @@ model must predict masked tokens.
 
 ---
 
-### training objective
+### Training Objective
 
 Diffusion training objective
 
@@ -179,7 +179,7 @@ Mt = masked token positions
 
 ---
 
-### token prediction example
+### Token Prediction Example
 
 input
 
@@ -214,7 +214,7 @@ $$
 where
 
 ```
-x-i = all tokens except xi
+x_{-i} = all tokens except x_i
 ```
 
 so the model can see **both past and future tokens**.
@@ -230,7 +230,7 @@ we divide the tokens into **blocks**.
 
 ---
 
-### example
+### Example
 
 split sequence
 
@@ -245,12 +245,12 @@ so it becomes x = [x¹, x²]
 
 ---
 
-### probability factorization
+### Probability Factorization
 
 BD3 factorization
 
 $$
-p(x) = \prod_{b=1}^{B} p(x^{b} \mid x^{<b})
+p(x) = \prod_{b=1}^{B} p(x^{b} \mid x_{<b})
 $$
 
 where
@@ -261,7 +261,7 @@ x<b = previous blocks
 
 ---
 
-### diffusion inside block
+### Diffusion Inside Block
 
 inside a block tokens are predicted with diffusion.
 
@@ -274,22 +274,22 @@ b2 = [on, the, [MASK]]
 
 ---
 
-### step 1 (block 1)
+### Step 1 (Block 1)
 
 model predicts masked tokens inside block1
 
 ```
-p(cat ∣ the sat)
+p(cat \mid the, sat)
 ```
 
 block1 only sees **block tokens**.
 
-### step 2 (block 2)
+### Step 2 (Block 2)
 
 block2 now sees **block1 tokens as context**
 
 ```
-p(table ∣ the cat sat + on the)
+p(table \mid the, cat, sat, on, the)
 ```
 
 so previous blocks become clean fixed context.
@@ -336,7 +336,9 @@ KV(block1) can be cached
 
 block2 attends to cached states from block1.
 
-# key difference
+# Key Difference
+
+![](./images/image.png)
 
 AR model learns
 
@@ -353,7 +355,7 @@ $$
 BD3LM learns
 
 $$
-p(x^b \mid x^{<b})
+p(x^b \mid x_{<b})
 $$
 
 where each block internally uses diffusion.
