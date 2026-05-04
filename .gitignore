@@ -8,3 +8,15 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local editor settings
+.vscode/
+
+# Training/evaluation outputs
+checkpoints/
+tmp_hparam_sweep/
+tmp_hparam_confirm/
+
+# Local run artifacts
+*.log
+.DS_Store
