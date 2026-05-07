@@ -10,6 +10,7 @@ import torch
 
 from diffusion import DiffusionConfig, DiscreteMaskDiffusion
 from model import DiffusionTransformer, DiffusionTransformerConfig
+from tokenizer_utils import HFTokenizerAdapter, load_tokenizer
 
 try:
     from rich.console import Console
@@ -31,49 +32,19 @@ except Exception:
     _RICH_AVAILABLE = False
 
 
-class ByteTokenizer:
-    PAD_ID = 256
-    MASK_ID = 257
-    BOS_ID = 258
-    EOS_ID = 259
-    VOCAB_SIZE = 260
-
-    def encode(self, text: str, max_len: int) -> list[int]:
-        token_bytes = list(text.encode("utf-8", errors="ignore"))
-        tokens = [self.BOS_ID] + token_bytes + [self.EOS_ID]
-        if len(tokens) > max_len:
-            tokens = tokens[:max_len]
-            if tokens[-1] != self.EOS_ID:
-                tokens[-1] = self.EOS_ID
-        return tokens
-
-    def decode(self, token_ids: list[int]) -> str:
-        raw = [t for t in token_ids if 0 <= t <= 255]
-        return bytes(raw).decode("utf-8", errors="ignore")
-
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def token_to_visible_slot(token_id: int, tokenizer: ByteTokenizer) -> str:
+def token_to_visible_slot(token_id: int, tokenizer: HFTokenizerAdapter) -> str:
     if token_id == tokenizer.MASK_ID:
         return "<MASK>"
     if token_id in (tokenizer.PAD_ID, tokenizer.BOS_ID, tokenizer.EOS_ID):
         return ""
-    if 0 <= token_id <= 255:
-        ch = chr(token_id)
-        if ch == "\n":
-            return "\\n"
-        if ch == "\t":
-            return "\\t"
-        if ch == "\r":
-            return "\\r"
-        if ch.isprintable():
-            return ch
-    return "?"
+    piece = tokenizer.id_to_token(token_id)
+    return piece if piece else "?"
 
 
 class MaskStreamRenderer:
@@ -235,7 +206,7 @@ def load_prompts(args: argparse.Namespace) -> list[str]:
 def generate_for_prompt(
     model: DiffusionTransformer,
     diffusion: DiscreteMaskDiffusion,
-    tokenizer: ByteTokenizer,
+    tokenizer: HFTokenizerAdapter,
     prompt: str,
     max_seq_len: int,
     max_new_tokens: int,
@@ -306,6 +277,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--stream", action="store_true", help="Live stream mask-first denoising updates")
     p.add_argument("--stream_every", type=int, default=1, help="Print every N denoising steps in stream mode")
+    p.add_argument(
+        "--tokenizer_name_or_path",
+        type=str,
+        default="",
+        help="Optional HF tokenizer path/name. By default, uses checkpoint directory.",
+    )
     return p.parse_args()
 
 
@@ -326,23 +303,20 @@ def main() -> None:
 
     payload = torch.load(ckpt_path, map_location=device)
     model_cfg = DiffusionTransformerConfig(**payload["model_config"])
-    # Hardcoded diffusion config for now (instead of loading from checkpoint metadata).
-    diff_cfg = DiffusionConfig(
-        num_steps=500,
-        mask_token_id=257,
-        pad_token_id=256,
-    )
+    diff_cfg = DiffusionConfig(**payload["diffusion_config"])
 
     model = DiffusionTransformer(model_cfg).to(device)
     model.load_state_dict(payload["model_state"])
     model.eval()
 
     diffusion = DiscreteMaskDiffusion(diff_cfg)
-    tokenizer = ByteTokenizer()
+    tok_ref = args.tokenizer_name_or_path if args.tokenizer_name_or_path else str(ckpt_path.parent)
+    tokenizer = load_tokenizer(tok_ref)
 
     prompts = load_prompts(args)
 
     print(f"Loaded checkpoint: {ckpt_path}")
+    print(f"Loaded tokenizer: {tok_ref} (vocab={tokenizer.VOCAB_SIZE})")
     print(f"Device: {device}")
 
     for p_idx, prompt in enumerate(prompts, start=1):

@@ -28,8 +28,13 @@ class DiscreteMaskDiffusion:
     def __init__(self, cfg: DiffusionConfig) -> None:
         self.cfg = cfg
 
-    def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.randint(1, self.cfg.num_steps + 1, (batch_size,), device=device)
+    def sample_timesteps(
+        self,
+        batch_size: int,
+        device: torch.device,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        return torch.randint(1, self.cfg.num_steps + 1, (batch_size,), device=device, generator=generator)
 
     def mask_probability(self, timesteps: torch.Tensor) -> torch.Tensor:
         return timesteps.float() / float(self.cfg.num_steps)
@@ -39,10 +44,11 @@ class DiscreteMaskDiffusion:
         x0: torch.Tensor,
         timesteps: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # x0: [batch, seq]
         probs = self.mask_probability(timesteps).unsqueeze(1)
-        rand = torch.rand_like(x0, dtype=torch.float32)
+        rand = torch.rand(x0.shape, device=x0.device, dtype=torch.float32, generator=generator)
         to_mask = rand < probs
 
         if attention_mask is not None:
@@ -60,10 +66,13 @@ class DiscreteMaskDiffusion:
         model,
         x0: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> dict[str, torch.Tensor]:
         batch_size = x0.size(0)
-        t = self.sample_timesteps(batch_size, x0.device)
-        x_t, masked_positions = self.q_sample(x0, t, attention_mask=attention_mask)
+        t = timesteps if timesteps is not None else self.sample_timesteps(batch_size, x0.device, generator=generator)
+        # this will return masked input and the positions that were masked
+        x_t, masked_positions = self.q_sample(x0, t, attention_mask=attention_mask, generator=generator)
 
         logits = model(x_t, t, attention_mask=attention_mask, causal=False)
         vocab_size = logits.size(-1)
@@ -126,87 +135,74 @@ class DiscreteMaskDiffusion:
 
         known = torch.zeros((batch_size, total_len), device=prefix_ids.device, dtype=torch.bool)
         known[:, :prefix_len] = True
+        gen_slice = slice(prefix_len, None)
+        neg_inf = torch.finfo(torch.float32).min
 
-        if stream_callback is not None:
+        def _emit(phase: str, step_value: int) -> None:
+            if stream_callback is None:
+                return
             stream_callback(
                 {
-                    "phase": "init",
-                    "step": self.cfg.num_steps,
-                    "generated_ids": x[:, prefix_len:].detach().clone(),
-                    "known_mask": known[:, prefix_len:].detach().clone(),
+                    "phase": phase,
+                    "step": step_value,
+                    "generated_ids": x[:, gen_slice].detach().clone(),
+                    "known_mask": known[:, gen_slice].detach().clone(),
                 }
             )
 
+        def _target_logits(curr_x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            logits = model(curr_x, t, attention_mask=None, causal=False)[:, gen_slice, :]
+            if 0 <= self.cfg.mask_token_id < logits.size(-1):
+                logits = logits.clone()
+                logits[..., self.cfg.mask_token_id] = torch.finfo(logits.dtype).min
+            return logits
+
+        _emit("init", self.cfg.num_steps)
+
         for step in range(self.cfg.num_steps, 0, -1):
             t = torch.full((batch_size,), step, device=prefix_ids.device, dtype=torch.long)
-            logits = model(x, t, attention_mask=None, causal=False)
-            target_logits = logits[:, prefix_len:, :]
-            if 0 <= self.cfg.mask_token_id < target_logits.size(-1):
-                target_logits = target_logits.clone()
-                target_logits[..., self.cfg.mask_token_id] = torch.finfo(target_logits.dtype).min
+            target_logits = _target_logits(x, t)
+            probs = F.softmax(target_logits.float() / max(temperature, 1e-8), dim=-1)
+            conf = probs.amax(dim=-1)
 
             if temperature <= 0:
-                pred_ids = target_logits.argmax(dim=-1)
-                conf = F.softmax(target_logits.float(), dim=-1).amax(dim=-1)
+                pred_ids = probs.argmax(dim=-1)
             else:
-                probs = F.softmax(target_logits.float() / temperature, dim=-1)
-                conf, greedy = probs.max(dim=-1)
-                draws = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(batch_size, -1)
-                pred_ids = draws
-                # Confidence is based on greedy prob, while token can still be sampled.
-                _ = greedy
+                pred_ids = torch.multinomial(probs.reshape(-1, probs.size(-1)), 1).reshape(batch_size, -1)
 
-            gen_known = known[:, prefix_len:]
+            gen_known = known[:, gen_slice]
             gen_unknown = ~gen_known
 
             if not gen_unknown.any():
                 break
 
-            for b in range(batch_size):
-                unknown_idx = torch.nonzero(gen_unknown[b], as_tuple=False).squeeze(-1)
-                if unknown_idx.numel() == 0:
-                    continue
+            # Reveal a shrinking fraction each step (MaskGIT-style schedule), vectorized.
+            unknown_counts = gen_unknown.sum(dim=-1)
+            reveal_counts = torch.clamp(torch.ceil(unknown_counts.float() / float(step)).to(torch.long), min=1)
+            reveal_counts = torch.minimum(reveal_counts, unknown_counts)
 
-                # Reveal a shrinking fraction each step (MaskGIT-style schedule).
-                reveal_count = max(1, math.ceil(unknown_idx.numel() / step))
-                scores = conf[b, unknown_idx]
-                top_local = torch.topk(scores, k=min(reveal_count, unknown_idx.numel())).indices
-                reveal_idx = unknown_idx[top_local]
+            conf_masked = conf.masked_fill(~gen_unknown, neg_inf)
+            sorted_idx = conf_masked.argsort(dim=-1, descending=True)
+            ranks = torch.empty_like(sorted_idx)
+            rank_values = torch.arange(sorted_idx.size(1), device=sorted_idx.device).unsqueeze(0).expand_as(sorted_idx)
+            ranks.scatter_(1, sorted_idx, rank_values)
+            reveal_mask = gen_unknown & (ranks < reveal_counts.unsqueeze(1))
 
-                x[b, prefix_len + reveal_idx] = pred_ids[b, reveal_idx]
-                known[b, prefix_len + reveal_idx] = True
+            x_gen = x[:, gen_slice]
+            x_gen[reveal_mask] = pred_ids[reveal_mask]
+            known[:, gen_slice] = known[:, gen_slice] | reveal_mask
 
-            if stream_callback is not None:
-                stream_callback(
-                    {
-                        "phase": "denoise",
-                        "step": step,
-                        "generated_ids": x[:, prefix_len:].detach().clone(),
-                        "known_mask": known[:, prefix_len:].detach().clone(),
-                    }
-                )
+            _emit("denoise", step)
 
         # Fill any leftover masked positions with final greedy decode.
-        if (~known[:, prefix_len:]).any():
+        if (~known[:, gen_slice]).any():
             t = torch.ones((batch_size,), device=prefix_ids.device, dtype=torch.long)
-            logits = model(x, t, attention_mask=None, causal=False)
-            target_logits = logits[:, prefix_len:, :]
-            if 0 <= self.cfg.mask_token_id < target_logits.size(-1):
-                target_logits = target_logits.clone()
-                target_logits[..., self.cfg.mask_token_id] = torch.finfo(target_logits.dtype).min
+            target_logits = _target_logits(x, t)
             final_pred = target_logits.argmax(dim=-1)
-            remaining = ~known[:, prefix_len:]
-            x[:, prefix_len:][remaining] = final_pred[remaining]
-            known[:, prefix_len:][remaining] = True
+            remaining = ~known[:, gen_slice]
+            x_gen = x[:, gen_slice]
+            x_gen[remaining] = final_pred[remaining]
+            known[:, gen_slice] = True
 
-        if stream_callback is not None:
-            stream_callback(
-                {
-                    "phase": "final",
-                    "step": 0,
-                    "generated_ids": x[:, prefix_len:].detach().clone(),
-                    "known_mask": known[:, prefix_len:].detach().clone(),
-                }
-            )
-
-        return x[:, prefix_len:]
+        _emit("final", 0)
+        return x[:, gen_slice]

@@ -9,30 +9,10 @@ from torch.utils.data import DataLoader
 
 from diffusion import DiffusionConfig, DiscreteMaskDiffusion
 from model import DiffusionTransformer, DiffusionTransformerConfig
+from tokenizer_utils import HFTokenizerAdapter, load_tokenizer
 
 
-class ByteTokenizer:
-    PAD_ID = 256
-    MASK_ID = 257
-    BOS_ID = 258
-    EOS_ID = 259
-    VOCAB_SIZE = 260
-
-    def encode(self, text: str, max_len: int) -> list[int]:
-        token_bytes = list(text.encode("utf-8", errors="ignore"))
-        tokens = [self.BOS_ID] + token_bytes + [self.EOS_ID]
-        if len(tokens) > max_len:
-            tokens = tokens[:max_len]
-            if tokens[-1] != self.EOS_ID:
-                tokens[-1] = self.EOS_ID
-        return tokens
-
-    def decode(self, token_ids: list[int]) -> str:
-        raw = [t for t in token_ids if 0 <= t <= 255]
-        return bytes(raw).decode("utf-8", errors="ignore")
-
-
-def make_collate_fn(tokenizer: ByteTokenizer, max_seq_len: int):
+def make_collate_fn(tokenizer: HFTokenizerAdapter, max_seq_len: int):
     def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
         input_ids = []
         attention_mask = []
@@ -94,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gen_tokens", type=int, default=128)
     p.add_argument("--prompt", type=str, default="Once upon a time")
     p.add_argument("--num_samples", type=int, default=3)
+    p.add_argument(
+        "--tokenizer_name_or_path",
+        type=str,
+        default="",
+        help="Optional HF tokenizer path/name. By default, uses checkpoint directory.",
+    )
     return p.parse_args()
 
 
@@ -104,7 +90,8 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = ByteTokenizer()
+    tok_ref = args.tokenizer_name_or_path if args.tokenizer_name_or_path else str(ckpt_path.parent)
+    tokenizer = load_tokenizer(tok_ref)
 
     payload = torch.load(ckpt_path, map_location=device)
     model_cfg = DiffusionTransformerConfig(**payload["model_config"])
@@ -125,6 +112,7 @@ def main() -> None:
     )
 
     loss, acc = evaluate(model, diffusion, loader, device, max_batches=args.max_eval_batches)
+    print(f"tokenizer_vocab={tokenizer.VOCAB_SIZE}")
     print(f"eval_loss={loss:.4f} eval_acc={acc:.4f}")
 
     prompt_ids = tokenizer.encode(args.prompt, model_cfg.max_seq_len - args.gen_tokens)

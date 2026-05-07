@@ -352,3 +352,98 @@ p(x^b \mid x_{1:b-1})
 where each block internally uses diffusion.
 
 Masking is the only modification introduced here, all other components, including the Transformer layers, FeedForward blocks, and normalization layers, remain unchanged.
+
+---
+
+# CLI Usage
+
+Install dependencies:
+
+```bash
+uv sync
+```
+
+## 1) Train (custom diffusion model on TinyStories)
+
+```bash
+uv run python src/train.py \
+  --output_dir checkpoints/tinystories_diffusion_v1 \
+  --max_steps 10000 \
+  --batch_size 32 \
+  --max_seq_len 256 \
+  --num_diffusion_steps 64
+```
+
+## 2) Inference from a saved checkpoint (`.pt`)
+
+```bash
+uv run python src/infer.py \
+  --checkpoint checkpoints/tinystories_diffusion_v1/latest.pt \
+  --prompt "Once upon a time" \
+  --max_new_tokens 128 \
+  --temperature 0.8
+```
+
+Live diffusion streaming:
+
+```bash
+uv run python src/infer.py \
+  --checkpoint checkpoints/tinystories_diffusion_v1/latest.pt \
+  --prompt "Tell me a short bedtime story" \
+  --stream \
+  --stream_every 4
+```
+
+## 3) Evaluate checkpoint + sample generations
+
+```bash
+uv run python src/eval.py \
+  --checkpoint checkpoints/tinystories_diffusion_v1/latest.pt \
+  --dataset_name roneneldan/TinyStories \
+  --eval_split validation \
+  --max_eval_batches 100 \
+  --gen_tokens 128 \
+  --num_samples 3
+```
+
+## 4) Quick model test / throughput (`src/test.py`)
+
+Causal mode:
+
+```bash
+uv run python src/test.py \
+  --model /path/to/model \
+  --prompt "Write a Python palindrome checker." \
+  --max-new-tokens 128
+```
+
+Diffusion (BD3LM) mode:
+
+```bash
+uv run python src/test.py \
+  --model /path/to/model \
+  --enable-diffusion \
+  --prompt "Write a Python palindrome checker." \
+  --max-new-tokens 128 \
+  --steps 128 \
+  --block-size 32
+```
+
+Diffusion with live stream:
+
+```bash
+uv run python src/test.py \
+  --model /path/to/model \
+  --enable-diffusion \
+  --stream \
+  --stream-every 4
+```
+
+## 5) Help for all options
+
+```bash
+uv run python src/train.py --help
+uv run python src/infer.py --help
+uv run python src/eval.py --help
+uv run python src/test.py --help
+```

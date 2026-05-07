@@ -15,27 +15,7 @@ from torch.utils.data import DataLoader
 
 from diffusion import DiffusionConfig, DiscreteMaskDiffusion
 from model import DiffusionTransformer, DiffusionTransformerConfig
-
-
-class ByteTokenizer:
-    PAD_ID = 256
-    MASK_ID = 257
-    BOS_ID = 258
-    EOS_ID = 259
-    VOCAB_SIZE = 260
-
-    def encode(self, text: str, max_len: int) -> list[int]:
-        token_bytes = list(text.encode("utf-8", errors="ignore"))
-        tokens = [self.BOS_ID] + token_bytes + [self.EOS_ID]
-        if len(tokens) > max_len:
-            tokens = tokens[:max_len]
-            if tokens[-1] != self.EOS_ID:
-                tokens[-1] = self.EOS_ID
-        return tokens
-
-    def decode(self, token_ids: list[int]) -> str:
-        raw = [t for t in token_ids if 0 <= t <= 255]
-        return bytes(raw).decode("utf-8", errors="ignore")
+from tokenizer_utils import DEFAULT_TOKENIZER_NAME, HFTokenizerAdapter, load_tokenizer
 
 
 def set_seed(seed: int) -> None:
@@ -44,7 +24,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def make_collate_fn(tokenizer: ByteTokenizer, max_seq_len: int):
+def make_collate_fn(tokenizer: HFTokenizerAdapter, max_seq_len: int):
     def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
         input_ids = []
         attention_mask = []
@@ -83,6 +63,9 @@ def evaluate_loss(
     loader: DataLoader,
     device: torch.device,
     max_batches: int,
+    deterministic: bool = False,
+    eval_seed: int = 0,
+    eval_repeats: int = 1,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -94,9 +77,20 @@ def evaluate_loss(
             break
         x0 = batch["input_ids"].to(device)
         attn = batch["attention_mask"].to(device)
-        stats = diffusion.training_loss(model, x0, attention_mask=attn)
-        total_loss += float(stats["loss"].item())
-        total_acc += float(stats["acc"].item())
+        repeats = max(1, eval_repeats)
+        batch_loss = 0.0
+        batch_acc = 0.0
+        for r in range(repeats):
+            if deterministic:
+                g = torch.Generator(device=x0.device.type)
+                g.manual_seed(eval_seed + i * 1009 + r)
+            else:
+                g = None
+            stats = diffusion.training_loss(model, x0, attention_mask=attn, generator=g)
+            batch_loss += float(stats["loss"].item())
+            batch_acc += float(stats["acc"].item())
+        total_loss += batch_loss / repeats
+        total_acc += batch_acc / repeats
         count += 1
 
     model.train()
@@ -105,7 +99,7 @@ def evaluate_loss(
     return {"loss": total_loss / count, "acc": total_acc / count}
 
 
-def build_dataloaders(args, tokenizer: ByteTokenizer):
+def build_dataloaders(args, tokenizer: HFTokenizerAdapter):
     train_ds = load_dataset(args.dataset_name, split=args.train_split)
 
     if args.eval_split:
@@ -167,6 +161,20 @@ def save_checkpoint(
     return ckpt_path
 
 
+def load_checkpoint(
+    ckpt_path: Path,
+    model: DiffusionTransformer,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    load_optimizer_state: bool = True,
+) -> int:
+    payload = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(payload["model_state"])
+    if load_optimizer_state:
+        optimizer.load_state_dict(payload["optimizer_state"])
+    return int(payload.get("step", 0))
+
+
 def save_training_curves(
     out_dir: Path,
     train_steps: list[int],
@@ -212,6 +220,26 @@ def save_training_curves(
         json.dump(history, f, indent=2)
 
 
+def load_training_curves(out_dir: Path) -> tuple[list[int], list[float], list[float], list[int], list[float], list[float]]:
+    path = out_dir / "training_metrics.json"
+    if not path.exists():
+        return [], [], [], [], [], []
+
+    with path.open("r", encoding="utf-8") as f:
+        history = json.load(f)
+
+    train = history.get("train", {})
+    eval_ = history.get("eval", {})
+    return (
+        list(train.get("steps", [])),
+        list(train.get("loss", [])),
+        list(train.get("acc", [])),
+        list(eval_.get("steps", [])),
+        list(eval_.get("loss", [])),
+        list(eval_.get("acc", [])),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a custom diffusion language model on TinyStories.")
 
@@ -219,6 +247,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train_split", type=str, default="train")
     p.add_argument("--eval_split", type=str, default="validation")
     p.add_argument("--eval_fraction", type=float, default=0.002)
+    p.add_argument("--tokenizer_name_or_path", type=str, default=DEFAULT_TOKENIZER_NAME)
 
     p.add_argument("--max_seq_len", type=int, default=256)
     p.add_argument("--dim", type=int, default=384)
@@ -246,9 +275,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_every", type=int, default=1000)
 
     p.add_argument("--output_dir", type=str, default="checkpoints")
+    p.add_argument("--resume_from", type=str, default="")
+    p.add_argument("--auto_resume", action="store_true")
+    p.add_argument("--reset_optimizer_on_resume", action="store_true")
+    p.add_argument("--restart_lr_schedule_on_resume", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max_train_examples", type=int, default=0)
     p.add_argument("--max_eval_examples", type=int, default=0)
+    p.add_argument("--eval_deterministic", action="store_true")
+    p.add_argument("--eval_seed", type=int, default=1234)
+    p.add_argument("--eval_repeats", type=int, default=1)
     return p.parse_args()
 
 
@@ -259,7 +295,17 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    tokenizer = ByteTokenizer()
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tokenizer = load_tokenizer(args.tokenizer_name_or_path)
+    tokenizer.save_pretrained(out_dir)
+    print(
+        f"Loaded tokenizer: {args.tokenizer_name_or_path} "
+        f"(vocab={tokenizer.VOCAB_SIZE}, mask_id={tokenizer.MASK_ID})"
+    )
+    print(f"Saved tokenizer files to: {out_dir}")
+
     train_loader, eval_loader = build_dataloaders(args, tokenizer)
 
     model_cfg = DiffusionTransformerConfig(
@@ -283,12 +329,48 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "run_config.json").open("w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
 
     global_step = 0
+    resume_path: Path | None = None
+    if args.resume_from:
+        resume_path = Path(args.resume_from)
+    elif args.auto_resume:
+        latest = out_dir / "latest.pt"
+        if latest.exists():
+            resume_path = latest
+
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        global_step = load_checkpoint(
+            resume_path,
+            model,
+            optimizer,
+            device,
+            load_optimizer_state=not args.reset_optimizer_on_resume,
+        )
+        print(
+            f"Resumed from checkpoint: {resume_path} (step={global_step}, "
+            f"reset_optimizer={args.reset_optimizer_on_resume})"
+        )
+    target_max_steps = args.max_steps
+    if resume_path is not None and args.max_steps <= global_step:
+        # Interpret max_steps as "additional steps" for resume when user passes
+        # a smaller value than the resumed global step.
+        target_max_steps = global_step + args.max_steps
+        print(
+            f"Resume requested with max_steps={args.max_steps} <= resumed step={global_step}. "
+            f"Continuing for +{args.max_steps} steps (target step={target_max_steps})."
+        )
+    lr_step_offset = global_step if (resume_path is not None and args.restart_lr_schedule_on_resume) else 0
+    if resume_path is not None and args.restart_lr_schedule_on_resume:
+        print(
+            f"Restarting LR schedule at resume step {global_step}. "
+            f"LR schedule span: {target_max_steps - lr_step_offset} steps."
+        )
+
     running_loss = 0.0
     running_acc = 0.0
     log_count = 0
@@ -299,9 +381,28 @@ def main() -> None:
     eval_steps: list[int] = []
     eval_losses: list[float] = []
     eval_accs: list[float] = []
+    if resume_path is not None:
+        (
+            train_steps,
+            train_losses,
+            train_accs,
+            eval_steps,
+            eval_losses,
+            eval_accs,
+        ) = load_training_curves(out_dir)
+        if train_steps:
+            keep = [i for i, s in enumerate(train_steps) if s <= global_step]
+            train_steps = [train_steps[i] for i in keep]
+            train_losses = [train_losses[i] for i in keep]
+            train_accs = [train_accs[i] for i in keep]
+        if eval_steps:
+            keep = [i for i, s in enumerate(eval_steps) if s <= global_step]
+            eval_steps = [eval_steps[i] for i in keep]
+            eval_losses = [eval_losses[i] for i in keep]
+            eval_accs = [eval_accs[i] for i in keep]
 
     model.train()
-    while global_step < args.max_steps:
+    while global_step < target_max_steps:
         for batch in train_loader:
             x0 = batch["input_ids"].to(device)
             attn = batch["attention_mask"].to(device)
@@ -316,8 +417,8 @@ def main() -> None:
 
             if (global_step + 1) % args.grad_accum_steps == 0:
                 lr = cosine_lr(
-                    step=global_step,
-                    total_steps=args.max_steps,
+                    step=max(0, global_step - lr_step_offset),
+                    total_steps=max(1, target_max_steps - lr_step_offset),
                     warmup_steps=args.warmup_steps,
                     max_lr=args.lr,
                     min_lr=args.min_lr,
@@ -348,7 +449,16 @@ def main() -> None:
                 start_time = time.time()
 
             if global_step % args.eval_every == 0:
-                val = evaluate_loss(model, diffusion, eval_loader, device, max_batches=50)
+                val = evaluate_loss(
+                    model,
+                    diffusion,
+                    eval_loader,
+                    device,
+                    max_batches=50,
+                    deterministic=args.eval_deterministic,
+                    eval_seed=args.eval_seed,
+                    eval_repeats=args.eval_repeats,
+                )
                 print(f"[eval] step={global_step:6d} val_loss={val['loss']:.4f} val_acc={val['acc']:.4f}")
                 eval_steps.append(global_step)
                 eval_losses.append(float(val["loss"]))
@@ -367,7 +477,7 @@ def main() -> None:
                 ckpt_path = save_checkpoint(out_dir, global_step, model, optimizer, model_cfg, diff_cfg, args)
                 print(f"Saved checkpoint: {ckpt_path}")
 
-            if global_step >= args.max_steps:
+            if global_step >= target_max_steps:
                 break
 
     ckpt_path = save_checkpoint(out_dir, global_step, model, optimizer, model_cfg, diff_cfg, args)
