@@ -56,6 +56,71 @@ def cosine_lr(step: int, total_steps: int, warmup_steps: int, max_lr: float, min
     return min_lr + (max_lr - min_lr) * cosine
 
 
+def sample_training_timesteps(
+    diffusion: DiscreteMaskDiffusion,
+    batch_size: int,
+    device: torch.device,
+    global_step: int,
+    curriculum_steps: int,
+    curriculum_start_max_t: float,
+    curriculum_end_max_t: float,
+) -> torch.Tensor:
+    if curriculum_steps <= 0:
+        return diffusion.sample_timesteps(batch_size, device)
+    progress = min(1.0, max(0.0, global_step / float(max(1, curriculum_steps))))
+    max_frac = curriculum_start_max_t + (curriculum_end_max_t - curriculum_start_max_t) * progress
+    max_frac = min(max(max_frac, 1.0 / diffusion.cfg.num_steps), 1.0)
+    max_t = int(round(max_frac * diffusion.cfg.num_steps))
+    max_t = min(max(max_t, 1), diffusion.cfg.num_steps)
+    return torch.randint(1, max_t + 1, (batch_size,), device=device)
+
+
+def compute_timestep_weights(
+    timesteps: torch.Tensor,
+    num_steps: int,
+    power: float,
+) -> torch.Tensor | None:
+    if abs(power) < 1e-12:
+        return None
+    t = timesteps.float() / float(max(1, num_steps))
+    # Positive power prioritizes lower-noise timesteps; negative power does the opposite.
+    base = (1.0 - t).clamp_min(1e-6) if power > 0 else t.clamp_min(1e-6)
+    w = base.pow(abs(power))
+    return w / w.mean().clamp_min(1e-8)
+
+
+def init_ema_state(model: DiffusionTransformer) -> dict[str, torch.Tensor]:
+    return {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
+
+
+def update_ema_state(model: DiffusionTransformer, ema_state: dict[str, torch.Tensor], decay: float) -> None:
+    one_minus = 1.0 - decay
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        ema_state[name].mul_(decay).add_(p.detach(), alpha=one_minus)
+
+
+def swap_in_ema_weights(
+    model: DiffusionTransformer,
+    ema_state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    backup: dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        backup[name] = p.detach().clone()
+        p.data.copy_(ema_state[name])
+    return backup
+
+
+def restore_weights(model: DiffusionTransformer, backup: dict[str, torch.Tensor]) -> None:
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        p.data.copy_(backup[name])
+
+
 @torch.no_grad()
 def evaluate_loss(
     model: DiffusionTransformer,
@@ -143,6 +208,7 @@ def save_checkpoint(
     model_cfg: DiffusionTransformerConfig,
     diff_cfg: DiffusionConfig,
     args,
+    ema_state: dict[str, torch.Tensor] | None = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / f"checkpoint_step_{step:07d}.pt"
@@ -154,6 +220,8 @@ def save_checkpoint(
         "diffusion_config": asdict(diff_cfg),
         "train_args": vars(args),
     }
+    if ema_state is not None:
+        payload["ema_state"] = ema_state
     torch.save(payload, ckpt_path)
 
     latest_path = out_dir / "latest.pt"
@@ -167,11 +235,21 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     load_optimizer_state: bool = True,
+    ema_state: dict[str, torch.Tensor] | None = None,
 ) -> int:
     payload = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(payload["model_state"])
     if load_optimizer_state:
         optimizer.load_state_dict(payload["optimizer_state"])
+    if ema_state is not None and "ema_state" in payload:
+        for k, v in payload["ema_state"].items():
+            ema_state[k] = v.to(device=device)
+    elif ema_state is not None:
+        # Resume from checkpoints created before EMA existed (or with EMA disabled):
+        # bootstrap EMA from loaded model weights to avoid evaluating random EMA params.
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                ema_state[name] = p.detach().clone()
     return int(payload.get("step", 0))
 
 
@@ -285,6 +363,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval_deterministic", action="store_true")
     p.add_argument("--eval_seed", type=int, default=1234)
     p.add_argument("--eval_repeats", type=int, default=1)
+    p.add_argument("--label_smoothing", type=float, default=0.0)
+    p.add_argument("--timestep_weight_power", type=float, default=0.0)
+    p.add_argument("--curriculum_steps", type=int, default=0)
+    p.add_argument("--curriculum_start_max_t", type=float, default=1.0)
+    p.add_argument("--curriculum_end_max_t", type=float, default=1.0)
+    p.add_argument("--ema_decay", type=float, default=0.0)
+    p.add_argument("--ema_eval", action="store_true")
     return p.parse_args()
 
 
@@ -328,6 +413,7 @@ def main() -> None:
     diffusion = DiscreteMaskDiffusion(diff_cfg)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    ema_state = init_ema_state(model) if args.ema_decay > 0 else None
 
     with (out_dir / "run_config.json").open("w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
@@ -350,6 +436,7 @@ def main() -> None:
             optimizer,
             device,
             load_optimizer_state=not args.reset_optimizer_on_resume,
+            ema_state=ema_state,
         )
         print(
             f"Resumed from checkpoint: {resume_path} (step={global_step}, "
@@ -407,7 +494,28 @@ def main() -> None:
             x0 = batch["input_ids"].to(device)
             attn = batch["attention_mask"].to(device)
 
-            stats = diffusion.training_loss(model, x0, attention_mask=attn)
+            timesteps = sample_training_timesteps(
+                diffusion=diffusion,
+                batch_size=x0.size(0),
+                device=x0.device,
+                global_step=global_step,
+                curriculum_steps=args.curriculum_steps,
+                curriculum_start_max_t=args.curriculum_start_max_t,
+                curriculum_end_max_t=args.curriculum_end_max_t,
+            )
+            timestep_weights = compute_timestep_weights(
+                timesteps=timesteps,
+                num_steps=diffusion.cfg.num_steps,
+                power=args.timestep_weight_power,
+            )
+            stats = diffusion.training_loss(
+                model,
+                x0,
+                attention_mask=attn,
+                timesteps=timesteps,
+                label_smoothing=args.label_smoothing,
+                timestep_weights=timestep_weights,
+            )
             loss = stats["loss"] / args.grad_accum_steps
             loss.backward()
 
@@ -429,6 +537,8 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                if ema_state is not None:
+                    update_ema_state(model, ema_state, args.ema_decay)
 
             global_step += 1
             train_steps.append(global_step)
@@ -449,6 +559,9 @@ def main() -> None:
                 start_time = time.time()
 
             if global_step % args.eval_every == 0:
+                backup = None
+                if ema_state is not None and args.ema_eval:
+                    backup = swap_in_ema_weights(model, ema_state)
                 val = evaluate_loss(
                     model,
                     diffusion,
@@ -459,6 +572,8 @@ def main() -> None:
                     eval_seed=args.eval_seed,
                     eval_repeats=args.eval_repeats,
                 )
+                if backup is not None:
+                    restore_weights(model, backup)
                 print(f"[eval] step={global_step:6d} val_loss={val['loss']:.4f} val_acc={val['acc']:.4f}")
                 eval_steps.append(global_step)
                 eval_losses.append(float(val["loss"]))
@@ -474,13 +589,15 @@ def main() -> None:
                 )
 
             if global_step % args.save_every == 0:
-                ckpt_path = save_checkpoint(out_dir, global_step, model, optimizer, model_cfg, diff_cfg, args)
+                ckpt_path = save_checkpoint(
+                    out_dir, global_step, model, optimizer, model_cfg, diff_cfg, args, ema_state=ema_state
+                )
                 print(f"Saved checkpoint: {ckpt_path}")
 
             if global_step >= target_max_steps:
                 break
 
-    ckpt_path = save_checkpoint(out_dir, global_step, model, optimizer, model_cfg, diff_cfg, args)
+    ckpt_path = save_checkpoint(out_dir, global_step, model, optimizer, model_cfg, diff_cfg, args, ema_state=ema_state)
     save_training_curves(
         out_dir=out_dir,
         train_steps=train_steps,

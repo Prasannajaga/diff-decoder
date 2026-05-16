@@ -68,6 +68,8 @@ class DiscreteMaskDiffusion:
         attention_mask: Optional[torch.Tensor] = None,
         timesteps: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        label_smoothing: float = 0.0,
+        timestep_weights: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         batch_size = x0.size(0)
         t = timesteps if timesteps is not None else self.sample_timesteps(batch_size, x0.device, generator=generator)
@@ -88,10 +90,25 @@ class DiscreteMaskDiffusion:
         if not loss_positions.any():
             loss_positions = valid
 
-        loss = F.cross_entropy(
-            logits[loss_positions].reshape(-1, vocab_size),
-            x0[loss_positions].reshape(-1),
-        )
+        flat_logits = logits[loss_positions].reshape(-1, vocab_size)
+        flat_targets = x0[loss_positions].reshape(-1)
+        if timestep_weights is not None:
+            if timestep_weights.ndim != 1 or timestep_weights.numel() != batch_size:
+                raise ValueError("timestep_weights must be shape [batch_size].")
+            weights = timestep_weights[:, None].expand_as(loss_positions)[loss_positions].reshape(-1)
+            token_loss = F.cross_entropy(
+                flat_logits,
+                flat_targets,
+                reduction="none",
+                label_smoothing=label_smoothing,
+            )
+            loss = (token_loss * weights).sum() / weights.sum().clamp_min(1e-8)
+        else:
+            loss = F.cross_entropy(
+                flat_logits,
+                flat_targets,
+                label_smoothing=label_smoothing,
+            )
 
         with torch.no_grad():
             pred = logits.argmax(dim=-1)

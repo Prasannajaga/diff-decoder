@@ -502,6 +502,56 @@ Preset variants by model size:
   --max_train_examples 0 --max_eval_examples 0
 ```
 
+## 40M preset (~39.95M params)
+
+- `dim=560`
+- `n_layers=7`
+- tuned for 6GB: very memory-tight, use high grad accumulation
+- train command:
+
+```bash
+./.venv/bin/python src/train.py \
+  --dataset_name roneneldan/TinyStories --train_split train --eval_split validation \
+  --tokenizer_name_or_path vuiseng9/bpe-10.0k-tinystories \
+  --dim 560 --n_layers 7 --n_heads 8 --n_kv_heads 2 \
+  --max_seq_len 256 --num_diffusion_steps 64 \
+  --batch_size 4 --eval_batch_size 4 --grad_accum_steps 8 \
+  --num_workers 2 \
+  --lr 6e-4 --min_lr 3e-5 --warmup_steps 30 \
+  --weight_decay 0.1 --grad_clip 1.0 \
+  --dropout 0.1 --ffn_mult 4.0 \
+  --max_steps 20000 \
+  --log_every 20 --eval_every 500 --save_every 1000 \
+  --seed 42 \
+  --output_dir checkpoints/preset_40m \
+  --max_train_examples 0 --max_eval_examples 0
+```
+
+## 50M preset (~50.08M params)
+
+- `dim=464`
+- `n_layers=14`
+- tuned for 6GB: extreme memory pressure, reduce batch first if OOM
+- train command:
+
+```bash
+./.venv/bin/python src/train.py \
+  --dataset_name roneneldan/TinyStories --train_split train --eval_split validation \
+  --tokenizer_name_or_path vuiseng9/bpe-10.0k-tinystories \
+  --dim 464 --n_layers 14 --n_heads 8 --n_kv_heads 2 \
+  --max_seq_len 256 --num_diffusion_steps 64 \
+  --batch_size 2 --eval_batch_size 2 --grad_accum_steps 16 \
+  --num_workers 2 \
+  --lr 6e-4 --min_lr 3e-5 --warmup_steps 30 \
+  --weight_decay 0.1 --grad_clip 1.0 \
+  --dropout 0.1 --ffn_mult 4.0 \
+  --max_steps 20000 \
+  --log_every 20 --eval_every 500 --save_every 1000 \
+  --seed 42 \
+  --output_dir checkpoints/preset_50m \
+  --max_train_examples 0 --max_eval_examples 0
+```
+
 If you still see OOM on 6GB:
 
 - first lower `--batch_size` by 2x

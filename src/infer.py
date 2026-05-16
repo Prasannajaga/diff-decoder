@@ -13,8 +13,7 @@ from model import DiffusionTransformer, DiffusionTransformerConfig
 from tokenizer_utils import HFTokenizerAdapter, load_tokenizer
 
 try:
-    from rich.console import Console
-    from rich.layout import Layout
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
     from rich.progress import (
@@ -74,19 +73,12 @@ class MaskStreamRenderer:
         )
 
         self.console = None
-        self.layout = None
         self.progress = None
         self.task_id = None
         self.live = None
 
         if self.use_rich:
             self.console = Console(force_terminal=True, color_system="truecolor")
-            self.layout = Layout()
-            self.layout.split_column(
-                Layout(name="text", ratio=1),
-                Layout(name="progress", size=3),
-            )
-
             self.progress = Progress(
                 SpinnerColumn(),
                 TextColumn("[bold blue]Diffusion"),
@@ -106,7 +98,7 @@ class MaskStreamRenderer:
                 pct="0%",
             )
             self.live = Live(
-                self.layout,
+                "",
                 console=self.console,
                 refresh_per_second=20,
                 transient=False,
@@ -122,7 +114,12 @@ class MaskStreamRenderer:
         sys.stdout.flush()
 
     def _render_rich(self) -> None:
-        assert self.layout is not None and self.progress is not None and self.task_id is not None
+        assert (
+            self.console is not None
+            and self.progress is not None
+            and self.task_id is not None
+            and self.live is not None
+        )
         slots_text = " ".join(self.slots if self.slots else [""])
         body = Text(f"{self.prompt} {slots_text}")
         panel = Panel(
@@ -132,7 +129,6 @@ class MaskStreamRenderer:
             border_style="cyan",
             padding=(1, 1),
         )
-        self.layout["text"].update(panel)
 
         completed = (self.total_steps - self.current_step) + 1
         completed = max(0, min(self.total_steps + 1, completed))
@@ -143,7 +139,7 @@ class MaskStreamRenderer:
             known=f"{self.known_count}/{self.total_tokens}",
             pct=f"{pct}%",
         )
-        self.layout["progress"].update(Panel(self.progress))
+        self.live.update(Group(panel, self.progress), refresh=True)
 
     def start(self) -> None:
         if not self.enabled or self._started:
@@ -301,7 +297,12 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available.")
 
-    payload = torch.load(ckpt_path, map_location=device)
+    try:
+        # Avoid FutureWarning and use the safer deserialization mode.
+        payload = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        # Backward compatibility with older PyTorch versions that don't support weights_only.
+        payload = torch.load(ckpt_path, map_location=device)
     model_cfg = DiffusionTransformerConfig(**payload["model_config"])
     diff_cfg = DiffusionConfig(**payload["diffusion_config"])
 
@@ -310,6 +311,7 @@ def main() -> None:
     model.eval()
 
     diffusion = DiscreteMaskDiffusion(diff_cfg)
+    diffusion.num_steps = 128  # ensure num_steps is set for sampling
     tok_ref = args.tokenizer_name_or_path if args.tokenizer_name_or_path else str(ckpt_path.parent)
     tokenizer = load_tokenizer(tok_ref)
 
